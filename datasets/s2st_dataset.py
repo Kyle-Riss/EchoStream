@@ -14,14 +14,24 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
+# Lazy import for torchaudio to avoid library loading issues
+torchaudio = None
+MelSpectrogram = None
+resample = None
 try:
     import torchaudio
     from torchaudio.transforms import MelSpectrogram
     from torchaudio.functional import resample
-except ImportError:
+except (ImportError, OSError) as e:
+    # OSError can occur if torchaudio library can't be loaded (e.g., symbol mismatch)
     torchaudio = None  # type: ignore
     MelSpectrogram = None  # type: ignore
     resample = None  # type: ignore
+    if "torchaudio" not in str(e).lower():
+        # Only print warning if it's not a known torchaudio issue
+        import warnings
+        warnings.warn(f"torchaudio not available: {e}")
+
 import os
 import soundfile as sf
 import librosa
@@ -38,10 +48,71 @@ class ManifestEntry:
     tgt_audio: Optional[Path]
     tgt_text: str
     tgt_units: Optional[Path] = None
+    src_n_frames: Optional[int] = None  # StreamSpeech 표준: 소스 오디오 프레임 수
+    tgt_n_frames: Optional[int] = None  # StreamSpeech 표준: 타겟 오디오 프레임 수
     src_lang: Optional[str] = None
     tgt_lang: Optional[str] = None
     speaker: Optional[str] = None
     duration: Optional[float] = None
+
+
+class SPMTokenizer:
+    """SentencePiece-based tokenizer wrapper.
+    
+    Uses SentencePiece model directly for proper subword tokenization.
+    Index convention (from SP model):
+        0: <s> (BOS)
+        1: <pad> (used as CTC blank)
+        2: </s> (EOS)
+        3: <unk>
+        4+: actual subword tokens
+    """
+    
+    def __init__(self, spm_model_path: str):
+        import sentencepiece as spm
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.load(spm_model_path)
+        self.id_to_token = [self.sp.id_to_piece(i) for i in range(self.sp.get_piece_size())]
+        self.token_to_id = {token: i for i, token in enumerate(self.id_to_token)}
+    
+    @property
+    def pad_id(self) -> int:
+        """PAD token (used as CTC blank) = 1"""
+        return self.sp.pad_id()
+    
+    @property
+    def unk_id(self) -> int:
+        """UNK token = 3"""
+        return self.sp.unk_id()
+    
+    @property
+    def bos_id(self) -> int:
+        """BOS token = 0"""
+        return self.sp.bos_id()
+    
+    @property
+    def eos_id(self) -> int:
+        """EOS token = 2"""
+        return self.sp.eos_id()
+    
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+        """Encode text to token IDs.
+        
+        Args:
+            text: Input text to encode
+            add_bos: Whether to add BOS token (ignored, kept for compatibility)
+            add_eos: Whether to add EOS token (ignored, kept for compatibility)
+        
+        Returns:
+            List of token IDs without BOS/EOS (model will add them)
+        """
+        ids = self.sp.encode(text, out_type=int)
+        # Remove BOS(0) and EOS(2) if present - model will add them
+        ids = [i for i in ids if i not in (self.bos_id, self.eos_id)]
+        return ids
+    
+    def __len__(self) -> int:
+        return self.sp.get_piece_size()
 
 
 class TextTokenizer:
@@ -58,7 +129,7 @@ class TextTokenizer:
     BOS = "<bos>"
     EOS = "<eos>"
 
-    def __init__(self, vocab_path: Optional[Path] = None, level: str = "word"):
+    def __init__(self, vocab_path: Optional[Path] = None, level: str = "word", spm_model_path: Optional[str] = None):
         if level not in {"word", "char"}:
             raise ValueError(f"Unsupported tokenisation level: {level}")
 
@@ -148,6 +219,9 @@ class TextTokenizer:
 class SpeechFeatureExtractor:
     """
     Extract log-mel spectrogram features from audio waveforms.
+    
+    Uses Kaldi-compatible fbank extraction (matching StreamSpeech) for consistency.
+    Falls back to PyTorch MelSpectrogram if torchaudio.compliance.kaldi is unavailable.
     """
 
     def __init__(
@@ -160,37 +234,75 @@ class SpeechFeatureExtractor:
         f_min: float = 0.0,
         f_max: Optional[float] = None,
         apply_log: bool = True,
+        use_kaldi_fbank: bool = True,  # Use Kaldi-compatible fbank (StreamSpeech style)
     ):
         self.sample_rate = sample_rate
+        self.num_mel_bins = num_mel_bins
         self.apply_log = apply_log
-        n_fft = n_fft or int(2 ** math.ceil(math.log2(sample_rate * win_length)))
-        win_length_samples = int(sample_rate * win_length)
-        hop_length_samples = int(sample_rate * hop_length)
+        self.use_kaldi_fbank = use_kaldi_fbank
+        
+        # Frame parameters (for Kaldi fbank)
+        self.frame_length_ms = win_length * 1000  # 25.0 ms
+        self.frame_shift_ms = hop_length * 1000   # 10.0 ms
+        
+        # Check if torchaudio.compliance.kaldi is available
+        self.has_kaldi = False
+        if use_kaldi_fbank:
+            try:
+                import torchaudio.compliance.kaldi as ta_kaldi
+                self.ta_kaldi = ta_kaldi
+                self.has_kaldi = True
+            except (ImportError, OSError, AttributeError) as e:
+                # OSError can occur if torchaudio library can't be loaded
+                print(f"⚠️  torchaudio.compliance.kaldi not available ({type(e).__name__}), falling back to MelSpectrogram")
+                self.has_kaldi = False
+        
+        # Fallback: PyTorch MelSpectrogram or librosa
+        if not self.has_kaldi:
+            if MelSpectrogram is not None:
+                # Use PyTorch MelSpectrogram
+                n_fft = n_fft or int(2 ** math.ceil(math.log2(sample_rate * win_length)))
+                win_length_samples = int(sample_rate * win_length)
+                hop_length_samples = int(sample_rate * hop_length)
 
-        if MelSpectrogram is None:
-            raise ImportError("MelSpectrogram unavailable. Please install torchaudio.")
-        self.melspec = MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            win_length=win_length_samples,
-            hop_length=hop_length_samples,
-            f_min=f_min,
-            f_max=f_max,
-            n_mels=num_mel_bins,
-            center=True,
-            power=2.0,
-            normalized=False,
-        )
+                self.melspec = MelSpectrogram(
+                    sample_rate=sample_rate,
+                    n_fft=n_fft,
+                    win_length=win_length_samples,
+                    hop_length=hop_length_samples,
+                    f_min=f_min,
+                    f_max=f_max,
+                    n_mels=num_mel_bins,
+                    center=True,
+                    power=2.0,
+                    normalized=False,
+                )
+                self.amp_to_db = torchaudio.transforms.AmplitudeToDB(top_db=None) if apply_log else None
+                self.use_librosa = False
+            else:
+                # Fallback to librosa
+                print("⚠️  torchaudio unavailable, using librosa for feature extraction")
+                self.use_librosa = True
+                self.melspec = None
+                self.amp_to_db = None
 
-        self.amp_to_db = torchaudio.transforms.AmplitudeToDB(top_db=None) if apply_log else None
-
-        self.hop_length_samples = hop_length_samples
-        self.win_length_samples = win_length_samples
+        self.hop_length_samples = int(sample_rate * hop_length)
+        self.win_length_samples = int(sample_rate * win_length)
 
     def frame_shift(self) -> float:
         return float(self.hop_length_samples) / float(self.sample_rate)
 
     def __call__(self, waveform: torch.Tensor, orig_sample_rate: int) -> torch.Tensor:
+        """
+        Extract features from waveform.
+        
+        Args:
+            waveform: Input waveform tensor [B, T] or [T]
+            orig_sample_rate: Original sample rate
+        
+        Returns:
+            features: [T, F] log-mel spectrogram features
+        """
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
 
@@ -203,11 +315,61 @@ class SpeechFeatureExtractor:
             else:
                 waveform = resample(waveform, orig_freq=orig_sample_rate, new_freq=self.sample_rate)
 
-        features = self.melspec(waveform)
-        if self.amp_to_db is not None:
-            features = self.amp_to_db(features)
-
-        features = features.squeeze(0).transpose(0, 1)  # [time, mel]
+        # Use Kaldi-compatible fbank (StreamSpeech style)
+        if self.has_kaldi:
+            # Kaldi fbank expects waveform in specific format
+            # Convert to mono if needed
+            if waveform.size(0) > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            
+            # Extract fbank features using Kaldi-compatible method
+            # This matches StreamSpeech's extract_fbank_features
+            features = self.ta_kaldi.fbank(
+                waveform,
+                num_mel_bins=self.num_mel_bins,
+                sample_frequency=self.sample_rate,
+                frame_length=self.frame_length_ms,
+                frame_shift=self.frame_shift_ms,
+            )
+            
+            # Kaldi fbank already returns log-mel features
+            # Output shape: [T, F] (time, mel)
+            features = features.squeeze(0)  # Remove batch dimension if present
+            if features.dim() == 1:
+                features = features.unsqueeze(0)
+            
+        else:
+            # Fallback: PyTorch MelSpectrogram or librosa
+            if self.use_librosa:
+                # Use librosa for feature extraction
+                y = waveform.squeeze(0).cpu().numpy()
+                if y.ndim > 1:
+                    y = y.mean(axis=0)
+                
+                # Extract mel spectrogram using librosa
+                features = librosa.feature.melspectrogram(
+                    y=y,
+                    sr=self.sample_rate,
+                    n_mels=self.num_mel_bins,
+                    hop_length=self.hop_length_samples,
+                    win_length=self.win_length_samples,
+                    fmin=f_min if hasattr(self, 'f_min') else 0.0,
+                    fmax=f_max if hasattr(self, 'f_min') else None,
+                )
+                
+                # Convert to log scale
+                if self.apply_log:
+                    features = librosa.power_to_db(features, ref=np.max)
+                
+                # Convert to tensor: [mel, time] -> [time, mel]
+                features = torch.from_numpy(features).float().transpose(0, 1)
+            else:
+                # Use PyTorch MelSpectrogram
+                features = self.melspec(waveform)
+                if self.amp_to_db is not None:
+                    features = self.amp_to_db(features)
+                features = features.squeeze(0).transpose(0, 1)  # [time, mel]
+        
         return features
 
 
@@ -268,10 +430,24 @@ class S2STManifestDataset(Dataset):
 
         self.entries = self._filter_entries(entries, min_duration, max_duration)
 
+        # Use SentencePiece for proper subword tokenization
+        # Check if SPM model path is provided in config
+        tgt_spm_model = Path(data_root) / "tgt_unigram6000/spm_unigram_en.model"
+        if tgt_spm_model.exists():
+            self.tgt_tokenizer = SPMTokenizer(str(tgt_spm_model))
+            print(f"✅ Using SentencePiece tokenizer: {tgt_spm_model}")
+            print(f"   Vocab size: {len(self.tgt_tokenizer)}")
+            print(f"   Special tokens: BOS={self.tgt_tokenizer.bos_id}, PAD={self.tgt_tokenizer.pad_id}, "
+                  f"EOS={self.tgt_tokenizer.eos_id}, UNK={self.tgt_tokenizer.unk_id}")
+        else:
+            # Fallback to TextTokenizer (old behavior)
+            self.tgt_tokenizer = TextTokenizer(tgt_vocab_path, level=text_level)
+            self.tgt_tokenizer.update_from_corpus(e.tgt_text for e in self.entries)
+            print(f"⚠️  Using TextTokenizer (fallback)")
+        
+        # Source tokenizer (Korean) - keep as is for now
         self.src_tokenizer = TextTokenizer(src_vocab_path, level=text_level)
-        self.tgt_tokenizer = TextTokenizer(tgt_vocab_path, level=text_level)
         self.src_tokenizer.update_from_corpus(e.src_text for e in self.entries)
-        self.tgt_tokenizer.update_from_corpus(e.tgt_text for e in self.entries)
 
         self.feature_extractor = SpeechFeatureExtractor(
             sample_rate=sample_rate,
@@ -362,6 +538,12 @@ class S2STManifestDataset(Dataset):
                 tgt_units_val = row.get("tgt_units")
                 tgt_units = Path(tgt_units_val) if tgt_units_val and tgt_units_val.strip() else None
 
+                # StreamSpeech 표준: src_n_frames, tgt_n_frames
+                src_n_frames_val = row.get("src_n_frames")
+                src_n_frames = int(src_n_frames_val) if src_n_frames_val and src_n_frames_val.strip() else None
+                tgt_n_frames_val = row.get("tgt_n_frames")
+                tgt_n_frames = int(tgt_n_frames_val) if tgt_n_frames_val and tgt_n_frames_val.strip() else None
+
                 duration_val = row.get("duration") or row.get("audio_len") or row.get("n_frames")
                 duration = float(duration_val) if duration_val else None
 
@@ -373,6 +555,8 @@ class S2STManifestDataset(Dataset):
                         tgt_audio=tgt_audio,
                         tgt_text=row["tgt_text"],
                         tgt_units=tgt_units,
+                        src_n_frames=src_n_frames,
+                        tgt_n_frames=tgt_n_frames,
                         src_lang=row.get("src_lang"),
                         tgt_lang=row.get("tgt_lang"),
                         speaker=row.get("speaker"),

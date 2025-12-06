@@ -32,6 +32,9 @@ class CTCDecoder(nn.Module):
         
         # Linear projection to vocabulary
         self.proj = nn.Linear(embed_dim, vocab_size)
+        # Initialize bias to 0 (PyTorch default, but explicit for clarity)
+        if hasattr(self.proj, 'bias') and self.proj.bias is not None:
+            nn.init.constant_(self.proj.bias, 0.0)
         self.dropout = nn.Dropout(dropout)
     
     def forward(
@@ -97,6 +100,7 @@ class CTCDecoderWithTransformerLayer(nn.Module):
         attention_dropout: float = 0.1,
         activation_dropout: float = 0.1,
         unidirectional: bool = True,  # For streaming
+        blank_penalty: float = 1.0,  # Penalty for blank token logit
     ):
         super().__init__()
         
@@ -104,6 +108,7 @@ class CTCDecoderWithTransformerLayer(nn.Module):
         self.num_layers = num_layers
         self.vocab_size = vocab_size
         self.unidirectional = unidirectional
+        self.blank_penalty = blank_penalty
         
         # Transformer layers
         self.layers = nn.ModuleList([
@@ -123,6 +128,10 @@ class CTCDecoderWithTransformerLayer(nn.Module):
         
         # CTC projection
         self.ctc_proj = nn.Linear(embed_dim, vocab_size)
+        
+        # Initialize all biases to zero (no special treatment for blank)
+        if hasattr(self.ctc_proj, 'bias') and self.ctc_proj.bias is not None:
+            nn.init.constant_(self.ctc_proj.bias, 0.0)
         
         self.dropout = nn.Dropout(dropout)
     
@@ -171,6 +180,10 @@ class CTCDecoderWithTransformerLayer(nn.Module):
         
         # CTC projection
         logits = self.ctc_proj(x)  # [T, B, V]
+        
+        # No blank penalty - let CTC learn naturally with proper vocab structure
+        # With blank=0 (<pad>) and targets containing only 1~vocab_size-1,
+        # CTC should learn the correct blank/non-blank balance automatically
         
         # Log softmax
         log_probs = nn.functional.log_softmax(logits, dim=-1)

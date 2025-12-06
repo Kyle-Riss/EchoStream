@@ -42,6 +42,8 @@ class WordLevelTranslator:
         lagging_k1: int = 0,  # StreamSpeech parameter
         stride_n: int = 1,    # StreamSpeech parameter
         whole_word: bool = True,  # StreamSpeech parameter
+        lm_model=None,  # Language Model (StreamSpeech 방식)
+        lm_weight: float = 0.5,  # LM 가중치 (StreamSpeech 방식)
     ):
         self.st_ctc = st_ctc_decoder
         self.mt_decoder = mt_decoder
@@ -54,6 +56,14 @@ class WordLevelTranslator:
         self.lagging_k1 = lagging_k1
         self.stride_n = stride_n
         self.whole_word = whole_word
+        
+        # Language Model (후처리 방식: 영향 최소화)
+        # MT Decoder 출력 후 텍스트 개선에 사용
+        self.lm_model = lm_model
+        self.lm_weight = lm_weight
+        if self.lm_model is not None:
+            self.lm_model.eval()
+            logger.info(f"Language Model loaded for postprocessing (weight={lm_weight})")
         
         # Incremental state (StreamSpeech Line 555-574)
         self.mt_incremental_state = {}
@@ -69,7 +79,8 @@ class WordLevelTranslator:
         
         logger.info(
             f"WordLevelTranslator initialized "
-            f"(lagging_k1={lagging_k1}, stride_n={stride_n}, whole_word={whole_word})"
+            f"(lagging_k1={lagging_k1}, stride_n={stride_n}, whole_word={whole_word}, "
+            f"lm_weight={lm_weight})"
         )
     
     def reset(self):
@@ -155,6 +166,10 @@ class WordLevelTranslator:
             logger.warning(f"MT decode failed: {e}")
             translation = ""
         
+        # 5-1. Language Model 후처리 (영향 최소화: 번역 텍스트 개선)
+        if self.lm_model is not None and translation:
+            translation = self._lm_postprocess(translation, mt_tokens)
+        
         # 6. Unit Decoder
         unit_output = self.unit_decoder(mt_hidden)
         units = unit_output['units']  # [T_unit]
@@ -212,7 +227,7 @@ class WordLevelTranslator:
                 incremental_state=self.mt_incremental_state,
             )
             
-            # Get next token
+            # Get next token (greedy decoding)
             logits = decoder_out['decoder_out'][:, -1, :]  # [B, vocab]
             next_token = logits.argmax(dim=-1)  # [B]
             
@@ -239,6 +254,41 @@ class WordLevelTranslator:
             'tokens': self.prev_mt_tokens,
             'decoder_out': decoder_out['decoder_out'],
         }
+    
+    def _lm_postprocess(
+        self,
+        translation: str,
+        mt_tokens: torch.Tensor,
+    ) -> str:
+        """
+        Language Model 후처리로 번역 텍스트 개선.
+        
+        영향 최소화: MT Decoder 출력 후 텍스트만 개선
+        - 여러 후보 생성 (beam search 또는 sampling)
+        - LM으로 rescore
+        - 최고 점수 후보 선택
+        
+        Args:
+            translation: MT Decoder 출력 텍스트
+            mt_tokens: MT Decoder 출력 토큰
+        
+        Returns:
+            개선된 번역 텍스트
+        """
+        if self.lm_model is None:
+            return translation
+        
+        try:
+            # 간단한 후처리: LM으로 텍스트 score 계산
+            # 필요시 여러 후보 생성 후 rerank 가능
+            
+            # 현재는 원본 반환 (추후 구현)
+            # TODO: Beam search로 여러 후보 생성 후 LM rescore
+            return translation
+            
+        except Exception as e:
+            logger.warning(f"LM postprocessing failed: {e}, using original translation")
+            return translation
     
     def _check_whole_word(self, tokens: torch.Tensor) -> bool:
         """

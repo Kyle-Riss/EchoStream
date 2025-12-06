@@ -18,6 +18,69 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from emformer_layer import EmformerEncoder
 
 
+class PositionalEmbedding(nn.Module):
+    """
+    Learnable positional embeddings (matching StreamSpeech Conformer).
+    
+    This is a simplified version that works with padding_mask input.
+    """
+    
+    def __init__(
+        self,
+        max_positions: int = 6000,
+        embedding_dim: int = 256,
+        padding_idx: int = 1,
+    ):
+        super().__init__()
+        
+        self.max_positions = max_positions
+        self.embedding_dim = embedding_dim
+        self.padding_idx = padding_idx
+        
+        # Learnable positional embeddings
+        self.weights = nn.Embedding(
+            max_positions + padding_idx + 1, 
+            embedding_dim, 
+            padding_idx=padding_idx
+        )
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        """Initialize positional embeddings."""
+        nn.init.normal_(self.weights.weight, mean=0, std=self.embedding_dim ** -0.5)
+        nn.init.constant_(self.weights.weight[self.padding_idx], 0)
+    
+    def forward(self, padding_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            padding_mask: [B, T] where True = padding, False = valid
+        
+        Returns:
+            positions: [T, B, D] positional embeddings (transposed for T-first format)
+        """
+        B, T = padding_mask.size()
+        
+        # Generate position indices: 0, 1, 2, ..., T-1 for each batch
+        # Offset by padding_idx + 1
+        positions = torch.arange(T, device=padding_mask.device, dtype=torch.long)
+        positions = positions.unsqueeze(0).expand(B, -1)  # [B, T]
+        positions = positions + self.padding_idx + 1  # Offset
+        
+        # Clamp to valid range
+        positions = positions.clamp(0, self.max_positions + self.padding_idx)
+        
+        # Get embeddings: [B, T, D]
+        pos_emb = self.weights(positions)
+        
+        # Transpose to [T, B, D] format (T-first for StreamSpeech compatibility)
+        pos_emb = pos_emb.transpose(0, 1)  # [T, B, D]
+        
+        return pos_emb
+
+
 class Conv2dSubsampler(nn.Module):
     """
     Convolutional Subsampler for speech features.
@@ -151,10 +214,15 @@ class EchoStreamSpeechEncoder(nn.Module):
         right_context_length: int = 0,
         memory_size: int = 8,
         
+        # Positional encoding
+        max_source_positions: int = 6000,
+        pos_enc_type: str = "abs",  # "abs" for absolute, "rel_pos" for relative
+        
         # Regularization
         dropout: float = 0.1,
         attention_dropout: float = 0.1,
         activation_dropout: float = 0.1,
+        no_scale_embedding: bool = False,
     ):
         super().__init__()
         
@@ -162,6 +230,10 @@ class EchoStreamSpeechEncoder(nn.Module):
         self.segment_length = segment_length
         self.left_context_length = left_context_length
         self.right_context_length = right_context_length
+        self.padding_idx = 1
+        
+        # Embed scale (matching StreamSpeech Conformer)
+        self.embed_scale = math.sqrt(encoder_embed_dim) if not no_scale_embedding else 1.0
         
         # Subsampling layer
         self.subsample = Conv2dSubsampler(
@@ -170,6 +242,26 @@ class EchoStreamSpeechEncoder(nn.Module):
             conv_out_channels=256,
             encoder_embed_dim=encoder_embed_dim,
         )
+        
+        # Positional embedding (matching StreamSpeech Conformer)
+        self.pos_enc_type = pos_enc_type
+        if pos_enc_type == "abs":
+            self.embed_positions = PositionalEmbedding(
+                max_positions=max_source_positions,
+                embedding_dim=encoder_embed_dim,
+                padding_idx=self.padding_idx,
+            )
+        else:
+            # For now, only support absolute positional encoding
+            # Relative positional encoding can be added later if needed
+            self.embed_positions = None
+        
+        # Linear projection (matching StreamSpeech Conformer)
+        self.linear = nn.Linear(encoder_embed_dim, encoder_embed_dim)
+        
+        # Dropout
+        self.dropout_module = nn.Dropout(dropout)
+        self.dropout = dropout
         
         # Emformer encoder
         self.emformer = EmformerEncoder(
@@ -183,8 +275,6 @@ class EchoStreamSpeechEncoder(nn.Module):
             ffn_embed_dim=encoder_ffn_embed_dim,
             dropout=dropout,
         )
-        
-        self.dropout = dropout
     
     def reset_cache(self):
         """Reset Emformer cache for new utterance."""
@@ -213,6 +303,27 @@ class EchoStreamSpeechEncoder(nn.Module):
         """
         # Subsampling: [B, T, 80] → [T/4, B, 256]
         x, input_lengths = self.subsample(src_tokens, src_lengths)
+        
+        # Create padding mask: [B, T'] where True = padding, False = valid
+        # StreamSpeech format: True for padding positions
+        max_len = x.size(0)  # T'
+        encoder_padding_mask = (
+            torch.arange(max_len, device=x.device).unsqueeze(0) >= input_lengths.unsqueeze(1)
+        )  # [B, T']
+        
+        # Apply embed scale (matching StreamSpeech Conformer)
+        x = self.embed_scale * x
+        
+        # Apply positional encoding (matching StreamSpeech Conformer)
+        if self.embed_positions is not None:
+            positions = self.embed_positions(encoder_padding_mask)  # [T', B, D]
+            x = x + positions
+        
+        # Linear projection (matching StreamSpeech Conformer)
+        x = self.linear(x)
+        
+        # Dropout (matching StreamSpeech Conformer)
+        x = self.dropout_module(x)
         
         # Emformer encoding
         emformer_out = self.emformer(x, input_lengths)

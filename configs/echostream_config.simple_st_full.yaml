@@ -1,0 +1,169 @@
+# EchoStream Configuration - SimpleCTCEncoder + ST-ONLY Full Training
+# Purpose: Baseline training with verified pipeline (CTC + ST + SPM)
+# Strategy: ST-only with SimpleCTCEncoder (BiLSTM) on full 2.4k dataset
+
+model_name: echostream_simple_st_full
+model_type: speech_to_speech
+
+# ============================================
+# Encoder: SimpleCTCEncoder (BiLSTM)
+# ============================================
+encoder:
+  type: simple  # Use SimpleCTCEncoder instead of Emformer
+  embed_dim: 128  # Match 10-sample overfit config!
+  layers: 4  # BiLSTM layers
+  attention_heads: 4  # Not used in BiLSTM, but kept for compatibility
+  ffn_embed_dim: 1024  # Not used in BiLSTM
+
+  # Input
+  input_feat_per_channel: 80   # Filter-bank features
+  input_channels: 1
+
+# ============================================
+# Decoders
+# ============================================
+
+# ASR CTC Decoder (disabled for ST-only)
+asr_decoder:
+  type: ctc
+  embed_dim: 128
+  vocab_size: 4000
+
+# ST CTC Decoder (main focus)
+st_decoder:
+  type: ctc_with_transformer
+  embed_dim: 128
+  layers: 2  # Transformer layers for better alignment
+  attention_heads: 4
+  vocab_size: 4000
+  unidirectional: true  # For future streaming
+
+# MT Decoder (disabled for ST-only)
+mt_decoder:
+  type: transformer
+  embed_dim: 128
+  layers: 2
+  attention_heads: 4
+  ffn_embed_dim: 1024
+  vocab_size: 4000
+
+# Unit Decoder (disabled for ST-only)
+unit_decoder:
+  type: ctc_transformer_unit
+  embed_dim: 128
+  layers: 2
+  attention_heads: 4
+  ffn_embed_dim: 1024
+  num_units: 1000
+  ctc_upsample_ratio: 5
+
+# ============================================
+# Vocoder
+# ============================================
+vocoder:
+  type: codehifigan
+  use_vocoder: true
+  checkpoint_path: /Users/hayubin/EchoStream/pretrain_models/unit-based_HiFi-GAN_vocoder/mHuBERT.layer11.km1000.en/g_00500000
+  config_path: /Users/hayubin/EchoStream/pretrain_models/unit-based_HiFi-GAN_vocoder/mHuBERT.layer11.km1000.en/config.json
+
+# ============================================
+# Training - ST-ONLY Full Dataset
+# ============================================
+training:
+  max_epochs: 30  # Reduced for faster iteration
+  batch_size: 8  # Increased from 2 for full data
+  max_tokens: 20000
+  update_freq: 2  # Effective batch = 16
+
+  # Optimizer
+  optimizer: adam
+  lr: 0.0003  # Standard learning rate
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1.0e-08
+  weight_decay: 0.0001
+
+  # LR schedule
+  lr_scheduler: inverse_sqrt
+  warmup_updates: 4000  # Longer warmup for full data
+  warmup_init_lr: 1.0e-07
+
+  # Regularization
+  dropout: 0.1
+  attention_dropout: 0.1
+  activation_dropout: 0.1
+  label_smoothing: 0.0  # No label smoothing for ST-only
+
+  # Gradient clipping
+  clip_norm: 10.0
+
+# ============================================
+# Multi-task Learning - ST-ONLY!!!
+# ============================================
+multitask:
+  # Task weights - ST ONLY for baseline
+  asr_weight: 0.0
+  st_weight: 1.0  # 100% focus on ST
+  mt_weight: 0.0
+  unit_weight: 0.0
+
+  # CTC mixing
+  ctc_weight: 0.5
+
+# ============================================
+# Streaming / Inference
+# ============================================
+streaming:
+  chunk_size: 40
+  wait_k: 5
+  ctc_threshold: 0.6
+  enable_punctuation: true
+  ct_transformer_path: pretrain_models/ct_transformer.onnx
+
+# ============================================
+# Data
+# ============================================
+data:
+  data_root: ../data
+  train_manifest: ../data/train_sampled.units.streamspeech_format_final.tsv
+  valid_manifest: ../data/dev_sampled.units.tsv
+  test_manifest: ../data/test_sampled.tsv
+  units_root: /Users/hayubin/EchoStream/data/units
+
+  # Preprocessing
+  use_audio_input: true
+  num_mel_bins: 80
+  sample_rate: 16000
+  load_tgt_units: true
+
+  # Global CMVN
+  global_cmvn_stats_npz: /Users/hayubin/EchoStream/data/gcmvn.npz
+
+  # Dictionaries
+  src_dict: /Users/hayubin/EchoStream/data/src_unigram6000/spm_unigram_ko.txt
+  tgt_dict: /Users/hayubin/EchoStream/data/tgt_unigram6000/spm_unigram_en_sp_format.txt
+  tgt_spm_model: /Users/hayubin/EchoStream/data/tgt_unigram6000/spm_unigram_en.model
+
+  # HuBERT units
+  hubert_model: /Users/hayubin/EchoStream/pretrain_models/mHuBERT/mhubert_base_vp_en_es_fr_it3_L11_km1000.bin
+  hubert_layer: 11
+  num_clusters: 1000
+
+# ============================================
+# Evaluation
+# ============================================
+evaluation:
+  compute_bleu: true
+  compute_asr_bleu: true
+  compute_latency: true
+  latency_metrics: [AL, AP, DAL]
+  target_latency_al: 1000
+
+# ============================================
+# Hardware
+# ============================================
+hardware:
+  num_gpus: 1
+  fp16: false  # Disable for CPU
+  distributed_world_size: 1
+
+

@@ -301,7 +301,9 @@ class EmformerEncoder(nn.Module):
         
         # Memory bank: stores memory for each layer
         # M_i^n comes from layer (n-1), segment (i-1)
-        self.memory_bank = [None for _ in range(self.num_layers)]
+        # Each layer maintains a list of memory tokens: [M_1, M_2, ..., M_{i-1}]
+        # This implements the key Emformer feature: "Memory-Augmented Chunkwise Attention"
+        self.memory_bank = [[] for _ in range(self.num_layers)]
     
     def forward(
         self,
@@ -358,9 +360,11 @@ class EmformerEncoder(nn.Module):
                 
                 # Get memory bank from lower layer (n-1)
                 # For layer 0, memory is None (no lower layer)
+                # Memory bank is a list of memory tokens: [M_1, M_2, ..., M_{i-1}]
                 memory = None
-                if layer_idx > 0:
-                    memory = self.memory_bank[layer_idx - 1]
+                if layer_idx > 0 and len(self.memory_bank[layer_idx - 1]) > 0:
+                    # Concatenate all memory tokens from previous segments
+                    memory = torch.cat(self.memory_bank[layer_idx - 1], dim=0)  # [M, B, D]
                 
                 # Forward through layer
                 layer_output_center, layer_output_right, cache = layer(
@@ -383,7 +387,13 @@ class EmformerEncoder(nn.Module):
                     self.left_context_cache[layer_idx]['value'].pop(0)
                 
                 # Update memory bank for upper layer (n+1)
-                self.memory_bank[layer_idx] = cache['memory']
+                # Append new memory token to the bank (accumulate across segments)
+                new_memory = cache['memory']  # [1, B, D]
+                self.memory_bank[layer_idx].append(new_memory)
+                
+                # Limit memory bank size to memory_size
+                if len(self.memory_bank[layer_idx]) > self.memory_size:
+                    self.memory_bank[layer_idx].pop(0)  # Remove oldest memory
                 
                 # Prepare input for next layer
                 layer_input_center = layer_output_center

@@ -59,3 +59,4 @@ echo ""
 echo "To stop training:"
 echo "   kill ${TRAIN_PID}"
 
+

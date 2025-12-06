@@ -64,7 +64,8 @@ class MultiTaskLoss(nn.Module):
         self.ctc_weight = ctc_weight
         
         # Loss functions
-        self.ctc_loss = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True)
+        # Use blank=1 to match SentencePiece <pad> token
+        self.ctc_loss = nn.CTCLoss(blank=1, reduction='mean', zero_infinity=True)
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=0, reduction='mean')
     
     def _ctc_forward(
@@ -171,24 +172,104 @@ class MultiTaskLoss(nn.Module):
             tgt_tokens = target.get('target_text')
             tgt_lengths = target.get('target_lengths')
             if tgt_tokens is not None and tgt_lengths is not None:
-                st_lengths = torch.clamp(tgt_lengths - 1, min=0)
-                flat_targets = self._flatten_tokens(tgt_tokens, tgt_lengths, exclude_last=True)
-                if flat_targets is not None and flat_targets.numel() > 0:
+                # Prepare CTC targets
+                # IMPORTANT: Do NOT filter out UNK tokens! They are valid tokens.
+                # Only exclude the CTC blank token (1 = <pad>) which should never appear in targets.
+                clean_targets = []
+                clean_lengths = []
+                for seq, length in zip(tgt_tokens, tgt_lengths):
+                    length_int = int(length.item())
+                    # exclude_last=True for ST CTC (EOS token 제외)
+                    if length_int > 0:
+                        length_int -= 1
+                    if length_int <= 0:
+                        continue
+                    seq_slice = seq[:length_int]
+                    # Filter out CTC blank (1 = <pad>), space token (11 = '▁'), and UNK (3)
+                    # UNK(16.1%) is causing CTC collapse - force model to learn only real subwords
+                    valid_mask = (seq_slice != 1) & (seq_slice != 11) & (seq_slice != 3)  # Exclude blank, space, UNK
+                    clean_seq = seq_slice[valid_mask]
+                    if clean_seq.numel() > 0:
+                        clean_targets.append(clean_seq)
+                        clean_lengths.append(clean_seq.numel())
+                
+                if clean_targets:
+                    flat_targets = torch.cat(clean_targets, dim=0)
+                    st_lengths = torch.tensor(clean_lengths, dtype=torch.long, device=st_log_probs.device)
+                    
                     input_lengths = torch.full(
                         (st_log_probs.size(1),),
                         st_log_probs.size(0),
                         dtype=torch.long,
                         device=st_log_probs.device,
                     )
+                    # Adjust if batch size doesn't match
+                    if st_lengths.size(0) < input_lengths.size(0):
+                        input_lengths = input_lengths[:st_lengths.size(0)]
+                        st_log_probs = st_log_probs[:, :st_lengths.size(0), :]
+                    
+                    # Debug: Print CTC inputs
+                    if torch.rand(1).item() < 0.05:  # 5% sampling
+                        logger.info(f"[ST CTC Debug] input_len={input_lengths[0].item()}, "
+                                   f"target_len={st_lengths[0].item()}, "
+                                   f"vocab_size={st_log_probs.size(-1)}, "
+                                   f"target_min={flat_targets.min().item()}, "
+                                   f"target_max={flat_targets.max().item()}")
+                    
+                    # 🔧 BLANK PENALTY V2: Continuous probability-based penalty
+                    # This provides proper gradient flow to discourage blank collapse
+                    
+                    # Method 1: Logit bias (initialization help)
+                    BLANK_LOGIT_BIAS = 5.0  # Subtract from blank logit (increased from 3.0)
+                    st_log_probs_adjusted = st_log_probs.clone()
+                    st_log_probs_adjusted[:, :, 1] = st_log_probs_adjusted[:, :, 1] - BLANK_LOGIT_BIAS
+                    
+                    # Compute CTC loss with adjusted logits
                     loss_val = self._ctc_forward(
-                        st_log_probs,
+                        st_log_probs_adjusted,  # Use adjusted logits with blank penalty
                         flat_targets,
                         input_lengths,
                         st_lengths,
                         weight=self.st_weight,
                     )
+                    
                     if loss_val is not None:
+                        # Method 2: Continuous blank probability penalty V3 (AGGRESSIVE!)
+                        # Remove threshold - penalize blank across entire range
+                        probs = st_log_probs.exp()  # [T, B, V]
+                        p_blank = probs[:, :, 1].mean()  # Average blank probability
+                        
+                        # V3 Changes:
+                        # 1. No threshold - penalize any blank usage
+                        # 2. Higher lambda (20 → 100)
+                        # 3. Squared penalty for stronger effect
+                        LAMBDA_BLANK = 100.0  # Much stronger than V2 (was 20.0)
+                        blank_penalty = p_blank ** 2  # No clamp - always penalize
+                        
+                        # Optional: Encourage non-blank
+                        p_nonblank = 1.0 - p_blank
+                        TARGET_NONBLANK = 0.6  # Want at least 60% non-blank
+                        LAMBDA_NONBLANK = 20.0
+                        nonblank_penalty = torch.clamp(TARGET_NONBLANK - p_nonblank, min=0.0)
+                        
+                        # Combined penalty
+                        total_penalty = LAMBDA_BLANK * blank_penalty + LAMBDA_NONBLANK * nonblank_penalty
+                        
+                        # Add to loss
+                        loss_val = loss_val + total_penalty
+                        
                         losses['st'] = loss_val
+                        
+                        # Debug: Monitor blank token predictions during training
+                        if torch.rand(1).item() < 0.1:  # 10% sampling for overfit test
+                            st_tokens_greedy = st_log_probs.argmax(dim=-1)  # [T, B]
+                            blank_ratio = (st_tokens_greedy == 1).float().mean().item()  # blank=1
+                            blank_log_prob = st_log_probs[:, :, 1].mean().item()
+                            non_blank_log_prob = st_log_probs[:, :, [i for i in range(st_log_probs.size(-1)) if i != 1]].mean().item()
+                            logger.info(f"[ST CTC Debug] blank_ratio={blank_ratio:.1%}, "
+                                       f"blank_log_prob={blank_log_prob:.4f}, "
+                                       f"non_blank_log_prob={non_blank_log_prob:.4f}, "
+                                       f"loss={loss_val.item():.4f}")
         
         # MT Loss (if MT decoder was used)
         if 'mt_logits' in model_output and model_output['mt_logits'] is not None:
@@ -523,7 +604,16 @@ def main(args):
             config_overrides['activation_dropout'] = training_cfg['activation_dropout']
 
     config = EchoStreamConfig.from_dict(config_overrides)
-    logger.info(f"Model: {config.encoder_layers}L Emformer + Decoders")
+    
+    # Override with command-line args
+    if hasattr(args, 'use_conformer') and args.use_conformer:
+        config.use_conformer = True
+        logger.info(f"Model: {config.encoder_layers}L ConformerEncoder + Decoders")
+    elif hasattr(args, 'use_simple_encoder') and args.use_simple_encoder:
+        config.use_simple_encoder = True
+        logger.info(f"Model: {config.encoder_layers}L SimpleCTCEncoder (BiLSTM) + Decoders")
+    else:
+        logger.info(f"Model: {config.encoder_layers}L Emformer + Decoders")
     
     # Build model
     model = build_echostream_model(config)
@@ -716,7 +806,30 @@ def main(args):
     best_dev_metrics = None
     best_checkpoint_path = Path(args.save_dir) / "checkpoint_best.pt"
     best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    for epoch in range(1, args.epochs + 1):
+    
+    # Resume from checkpoint if provided
+    start_epoch = 1
+    if args.resume_from_checkpoint:
+        checkpoint_path = Path(args.resume_from_checkpoint)
+        if checkpoint_path.exists():
+            logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if 'model' in checkpoint:
+                model.load_state_dict(checkpoint['model'])
+            else:
+                model.load_state_dict(checkpoint)
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                logger.info(f"Resuming from epoch {start_epoch}")
+            if 'loss' in checkpoint and isinstance(checkpoint['loss'], (int, float)):
+                best_dev_loss = checkpoint['loss']
+                logger.info(f"Previous best dev loss: {best_dev_loss:.4f}")
+        else:
+            logger.warning(f"Checkpoint not found: {checkpoint_path}. Starting from scratch.")
+    
+    for epoch in range(start_epoch, args.epochs + 1):
         logger.info(f"\nEpoch {epoch}/{args.epochs}")
         
         # Get update_freq from config (for gradient accumulation)
@@ -865,12 +978,15 @@ if __name__ == "__main__":
     parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training (AMP).")
     parser.add_argument("--detect-anomaly", action="store_true", help="Enable torch autograd anomaly detection.")
     parser.add_argument("--retain-graph", action="store_true", help="Call backward(retain_graph=True) for debugging.")
+    parser.add_argument("--use-simple-encoder", action="store_true", help="Use SimpleCTCEncoder (BiLSTM) instead of Emformer.")
+    parser.add_argument("--use-conformer", action="store_true", help="Use ConformerEncoder instead of Emformer.")
     
     # Evaluation / checkpointing
     parser.add_argument("--dev-manifest", type=str, default=None)
     parser.add_argument("--test-manifest", type=str, default=None)
     parser.add_argument("--save-dir", type=str, default="checkpoints/")
     parser.add_argument("--save-interval", type=int, default=10)
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--metrics-output", type=str, default=None)
     
     args = parser.parse_args()

@@ -36,3 +36,4 @@ export ECHOSTREAM_FORCED_UNITS="$UNITS_FILE"
 uvicorn server.fastapi_app:app --host 0.0.0.0 --port 8000
 
 
+

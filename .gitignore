@@ -8,3 +8,44 @@ pretrain_models/
 checkpoints/checkpoint_epoch_*.pt
 
 
+
+# Checkpoint files (too large for git)
+checkpoints_*/
+*.pt
+!**/__pycache__/
+
+# Checkpoint files (too large for git)
+checkpoints_*/
+*.pt
+checkpoints/
+*.ckpt
+
+# Data files (too large)
+data/*.tsv
+data/*.wav
+data/*.mp3
+data/*.flac
+!data/.gitkeep
+
+# Results and logs
+results/*.log
+results/*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Model files
+*.pth
+*.pkl
+*.h5
+*.onnx

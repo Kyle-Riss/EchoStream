@@ -170,6 +170,7 @@ class EchoStreamService:
         self.feature_extractor = SpeechFeatureExtractor(
             sample_rate=self.sample_rate,
             num_mel_bins=num_mel_bins,
+            use_kaldi_fbank=True,  # Use Kaldi-compatible fbank (StreamSpeech style)
         )
 
         cmvn_path = data_cfg.get("global_cmvn_stats_npz")

@@ -17,6 +17,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from echostream_encoder import EchoStreamSpeechEncoder
+from simple_encoder import SimpleCTCEncoder  # Simple BiLSTM baseline
+from conformer_encoder import ConformerEncoder  # Conformer baseline
 from decoders import (
     CTCDecoder,
     CTCDecoderWithTransformerLayer,
@@ -77,24 +79,52 @@ class EchoStreamModel(nn.Module):
         
         # Regularization
         dropout: float = 0.1,
+        
+        # Encoder type selection
+        use_simple_encoder: bool = False,  # Use SimpleCTCEncoder (BiLSTM) instead of Emformer
+        use_conformer: bool = False,  # Use ConformerEncoder instead of Emformer
     ):
         super().__init__()
         
         # Streaming MT state: accumulated target tokens (batch size = 1 assumed for streaming)
         self._mt_prev_tokens: Optional[torch.Tensor] = None  # [1, T_prev]
         
-        # Emformer Encoder
-        self.encoder = EchoStreamSpeechEncoder(
-            encoder_embed_dim=encoder_embed_dim,
-            encoder_layers=encoder_layers,
-            encoder_attention_heads=encoder_attention_heads,
-            encoder_ffn_embed_dim=encoder_ffn_embed_dim,
-            segment_length=segment_length,
-            left_context_length=left_context_length,
-            right_context_length=right_context_length,
-            memory_size=memory_size,
-            dropout=dropout,
-        )
+        # Encoder selection
+        if use_conformer:
+            # Conformer encoder (StreamSpeech baseline)
+            print("🔧 Using ConformerEncoder instead of Emformer")
+            self.encoder = ConformerEncoder(
+                input_dim=80,  # Mel-spectrogram features
+                embed_dim=encoder_embed_dim,
+                num_layers=encoder_layers,
+                num_heads=encoder_attention_heads,
+                ffn_embed_dim=encoder_ffn_embed_dim,
+                conv_kernel_size=31,  # Standard Conformer kernel
+                dropout=dropout,
+                attention_dropout=dropout,
+            )
+        elif use_simple_encoder:
+            # Simple BiLSTM encoder for baseline/debugging
+            print("🔧 Using SimpleCTCEncoder (BiLSTM) instead of Emformer")
+            self.encoder = SimpleCTCEncoder(
+                input_dim=80,  # Mel-spectrogram features
+                hidden_dim=encoder_embed_dim,
+                num_layers=encoder_layers,
+                dropout=dropout,
+            )
+        else:
+            # Emformer Encoder
+            self.encoder = EchoStreamSpeechEncoder(
+                encoder_embed_dim=encoder_embed_dim,
+                encoder_layers=encoder_layers,
+                encoder_attention_heads=encoder_attention_heads,
+                encoder_ffn_embed_dim=encoder_ffn_embed_dim,
+                segment_length=segment_length,
+                left_context_length=left_context_length,
+                right_context_length=right_context_length,
+                memory_size=memory_size,
+                dropout=dropout,
+            )
         
         # ==================================
         # Decoders
@@ -108,18 +138,19 @@ class EchoStreamModel(nn.Module):
         )
         
         # ST CTC Decoder (for translation)
+        # Using SentencePiece vocab: blank=1 (<pad> token)
         self.st_ctc_decoder = CTCDecoderWithTransformerLayer(
             embed_dim=encoder_embed_dim,
             num_layers=st_decoder_layers,
             num_heads=encoder_attention_heads,
-            vocab_size=6000,  # Target language vocab
+            vocab_size=4000,  # SentencePiece vocab size
             unidirectional=True,  # For streaming
             dropout=dropout,
         )
         
         # MT Decoder (for text refinement)
         self.mt_decoder = TransformerMTDecoder(
-            vocab_size=6000,  # Target language vocab
+            vocab_size=4000,  # SentencePiece vocab size
             embed_dim=decoder_embed_dim,
             num_layers=mt_decoder_layers,
             num_heads=encoder_attention_heads,
@@ -197,10 +228,25 @@ class EchoStreamModel(nn.Module):
         # ==================================
         # 3. ST CTC Decoder
         # ==================================
+        # Debug: Check encoder output before ST CTC
+        if hasattr(self, '_debug_logging') and self._debug_logging:
+            print(f"🔍 [ST CTC Input] Encoder output: {encoder_hidden.shape}, mean={encoder_hidden.mean().item():.4f}, std={encoder_hidden.std().item():.4f}")
+        
         st_out = self.st_ctc_decoder(
             encoder_out=encoder_hidden,  # [T', B, D] tensor
             encoder_padding_mask=encoder_padding_mask,  # [B, T'] tensor or None
         )
+        
+        # Debug: Check ST CTC output immediately
+        if hasattr(self, '_debug_logging') and self._debug_logging:
+            st_logits = st_out['logits']
+            st_log_probs = st_out['log_probs']
+            print(f"🔍 [ST CTC Output] logits: {st_logits.shape}, mean={st_logits.mean().item():.4f}, std={st_logits.std().item():.4f}")
+            print(f"🔍 [ST CTC Output] log_probs: {st_log_probs.shape}, mean={st_log_probs.mean().item():.4f}, max={st_log_probs.max().item():.4f}")
+            # Check blank token probability
+            blank_log_prob = st_log_probs[:, :, 0].mean().item()
+            non_blank_log_prob = st_log_probs[:, :, 1:].mean().item()
+            print(f"🔍 [ST CTC] Blank (idx 0) avg log_prob: {blank_log_prob:.4f}, Non-blank avg: {non_blank_log_prob:.4f}")
         
         # ==================================
         # 4. MT Decoder (for text refinement)
@@ -214,6 +260,15 @@ class EchoStreamModel(nn.Module):
             # Greedy decoding from ST CTC log_probs: [T, B, V] -> [T, B]
             st_log_probs = st_out['log_probs']  # [T, B, V]
             st_tokens_greedy = st_log_probs.argmax(dim=-1)  # [T, B]
+            
+            # Debug: Check ST CTC output
+            if hasattr(self, '_debug_logging') and self._debug_logging:
+                import logging
+                logger = logging.getLogger(__name__)
+                blank_count = (st_tokens_greedy == 0).sum().item()
+                pad_count = (st_tokens_greedy == 1).sum().item()
+                total = st_tokens_greedy.numel()
+                logger.info(f"ST CTC greedy decode: {st_tokens_greedy.shape}, blanks={blank_count}/{total}, pads={pad_count}/{total}")
             
             # CTC collapse: remove blanks and duplicates
             # For batch size 1: [T, 1] -> [T]
@@ -231,6 +286,11 @@ class EchoStreamModel(nn.Module):
                             collapsed_tokens.append(token_val)
                         prev_token = token_val
                 
+                if hasattr(self, '_debug_logging') and self._debug_logging:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"ST CTC collapsed: {len(collapsed_tokens)} tokens (from {len(st_tokens_seq)})")
+                
                 if len(collapsed_tokens) > 0:
                     # Convert to tensor for MT decoder: [T_collapsed] -> [1, T_collapsed]
                     st_tokens_for_mt = torch.tensor(
@@ -244,6 +304,13 @@ class EchoStreamModel(nn.Module):
                         import logging
                         logger = logging.getLogger(__name__)
                         logger.info(f"ST CTC decoded: {len(collapsed_tokens)} tokens (before MT)")
+                else:
+                    # No valid tokens after collapse
+                    if hasattr(self, '_debug_logging') and self._debug_logging:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(f"ST CTC collapsed to empty! All tokens were blank/pad/duplicates")
+                    st_tokens_for_mt = None
         
         # Use provided prev_output_tokens if available, otherwise use ST CTC decoded tokens
         # Accumulate tokens across calls to emulate incremental MT decoding
@@ -282,7 +349,10 @@ class EchoStreamModel(nn.Module):
             if hasattr(self, '_debug_logging') and self._debug_logging:
                 import logging
                 logger = logging.getLogger(__name__)
-                logger.warning("MT Decoder skipped: No input tokens available")
+                logger.warning(f"MT Decoder skipped: No input tokens available (st_tokens_for_mt={st_tokens_for_mt is not None}, prev_output_tokens={prev_output_tokens is not None})")
+            else:
+                # Print to console if debug logging not enabled
+                print(f"⚠️  MT Decoder skipped: No input tokens (st_tokens_for_mt={st_tokens_for_mt is not None}, prev_output_tokens={prev_output_tokens is not None})")
         
         # ==================================
         # 5. Unit Decoder
@@ -336,6 +406,10 @@ class EchoStreamConfig:
     """Configuration for EchoStream model."""
     
     def __init__(self):
+        # Encoder type
+        self.use_simple_encoder = False  # Set to True to use SimpleCTCEncoder (BiLSTM)
+        self.use_conformer = False  # Set to True to use ConformerEncoder
+        
         # Encoder
         self.encoder_embed_dim = 256
         self.encoder_layers = 16
@@ -398,6 +472,8 @@ def build_echostream_model(config: EchoStreamConfig) -> EchoStreamModel:
         unit_decoder_layers=config.unit_decoder_layers,
         st_decoder_layers=config.st_decoder_layers,
         dropout=config.dropout,
+        use_simple_encoder=config.use_simple_encoder,  # SimpleCTCEncoder option
+        use_conformer=config.use_conformer,  # ConformerEncoder option
     )
     
     # Initialize vocoder with checkpoint and config if provided
