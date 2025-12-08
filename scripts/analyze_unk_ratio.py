@@ -140,7 +140,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=str, default="data/train_mini_10.tsv")
-    parser.add_argument("--spm-model", type=str, default="data/tgt_unigram6000/spm_unigram_en.model")
+    parser.add_argument("--spm-model", type=str, default="data/tgt_unigram5000/spm_unigram_en.model")
     parser.add_argument("--data-root", type=str, default="data")
     args = parser.parse_args()
     

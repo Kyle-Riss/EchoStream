@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -18,19 +19,27 @@ import numpy as np
 torchaudio = None
 MelSpectrogram = None
 resample = None
-try:
-    import torchaudio
-    from torchaudio.transforms import MelSpectrogram
-    from torchaudio.functional import resample
-except (ImportError, OSError) as e:
-    # OSError can occur if torchaudio library can't be loaded (e.g., symbol mismatch)
+
+# Allow skipping torchaudio import when it causes segfaults (e.g., macOS wheels mismatch)
+_skip_torchaudio = os.environ.get("SKIP_TORCHAUDIO", "").lower() in ("1", "true", "yes")
+if not _skip_torchaudio:
+    try:
+        import torchaudio
+        from torchaudio.transforms import MelSpectrogram
+        from torchaudio.functional import resample
+    except (ImportError, OSError) as e:
+        # OSError can occur if torchaudio library can't be loaded (e.g., symbol mismatch)
+        torchaudio = None  # type: ignore
+        MelSpectrogram = None  # type: ignore
+        resample = None  # type: ignore
+        if "torchaudio" not in str(e).lower():
+            # Only print warning if it's not a known torchaudio issue
+            import warnings
+            warnings.warn(f"torchaudio not available: {e}")
+else:
     torchaudio = None  # type: ignore
     MelSpectrogram = None  # type: ignore
     resample = None  # type: ignore
-    if "torchaudio" not in str(e).lower():
-        # Only print warning if it's not a known torchaudio issue
-        import warnings
-        warnings.warn(f"torchaudio not available: {e}")
 
 import os
 import soundfile as sf
@@ -432,14 +441,37 @@ class S2STManifestDataset(Dataset):
 
         # Use SentencePiece for proper subword tokenization
         # Check if SPM model path is provided in config
-        tgt_spm_model = Path(data_root) / "tgt_unigram6000/spm_unigram_en.model"
-        if tgt_spm_model.exists():
-            self.tgt_tokenizer = SPMTokenizer(str(tgt_spm_model))
-            print(f"✅ Using SentencePiece tokenizer: {tgt_spm_model}")
+        # Priority: tgt_vocab_path > tgt_unigram5000 > tgt_unigram6000 (fallback)
+        tgt_tokenizer_loaded = False
+        if tgt_vocab_path and Path(tgt_vocab_path).exists():
+            self.tgt_tokenizer = SPMTokenizer(tgt_vocab_path)
+            tgt_tokenizer_loaded = True
+            print(f"✅ Using SentencePiece tokenizer: {tgt_vocab_path}")
             print(f"   Vocab size: {len(self.tgt_tokenizer)}")
             print(f"   Special tokens: BOS={self.tgt_tokenizer.bos_id}, PAD={self.tgt_tokenizer.pad_id}, "
                   f"EOS={self.tgt_tokenizer.eos_id}, UNK={self.tgt_tokenizer.unk_id}")
         else:
+            # Try tgt_unigram5000 first (new default)
+            tgt_spm_model = Path(data_root) / "tgt_unigram5000/spm_unigram_en.model"
+            if tgt_spm_model.exists():
+                self.tgt_tokenizer = SPMTokenizer(str(tgt_spm_model))
+                tgt_tokenizer_loaded = True
+                print(f"✅ Using SentencePiece tokenizer: {tgt_spm_model}")
+                print(f"   Vocab size: {len(self.tgt_tokenizer)}")
+                print(f"   Special tokens: BOS={self.tgt_tokenizer.bos_id}, PAD={self.tgt_tokenizer.pad_id}, "
+                      f"EOS={self.tgt_tokenizer.eos_id}, UNK={self.tgt_tokenizer.unk_id}")
+            else:
+                # Fallback to old path (for backward compatibility)
+                tgt_spm_model = Path(data_root) / "tgt_unigram6000/spm_unigram_en.model"
+                if tgt_spm_model.exists():
+                    self.tgt_tokenizer = SPMTokenizer(str(tgt_spm_model))
+                    tgt_tokenizer_loaded = True
+                    print(f"✅ Using SentencePiece tokenizer: {tgt_spm_model}")
+                    print(f"   Vocab size: {len(self.tgt_tokenizer)}")
+                    print(f"   Special tokens: BOS={self.tgt_tokenizer.bos_id}, PAD={self.tgt_tokenizer.pad_id}, "
+                          f"EOS={self.tgt_tokenizer.eos_id}, UNK={self.tgt_tokenizer.unk_id}")
+        
+        if not tgt_tokenizer_loaded:
             # Fallback to TextTokenizer (old behavior)
             self.tgt_tokenizer = TextTokenizer(tgt_vocab_path, level=text_level)
             self.tgt_tokenizer.update_from_corpus(e.tgt_text for e in self.entries)
@@ -717,16 +749,47 @@ class S2STManifestDataset(Dataset):
         if audio_path.suffix in {".npy", ".npz"}:
             raise ValueError(f"Source audio path points to units file: {audio_path}. Check manifest format.")
 
-        waveform, sr = self._safe_load_audio(audio_path, self.feature_extractor.sample_rate)
-        processed_waveform = waveform
-        processed_sr = sr
-        if sr != self.feature_extractor.sample_rate:
-            processed_sr = self.feature_extractor.sample_rate
+        # Try to load pre-extracted features first (for faster inference)
+        # Look for .npy or .npz file with same stem as audio file
+        feature_path = audio_path.parent / f"{audio_path.stem}.npy"
+        if not feature_path.exists():
+            feature_path = audio_path.parent / f"{audio_path.stem}.npz"
+        
+        features = None
+        processed_waveform = None  # Initialize to None
+        
+        if feature_path.exists():
+            # Load pre-extracted features
+            try:
+                if feature_path.suffix == ".npy":
+                    features = torch.from_numpy(np.load(feature_path)).float()
+                else:  # .npz
+                    data = np.load(feature_path)
+                    # Try common keys
+                    if "features" in data:
+                        features = torch.from_numpy(data["features"]).float()
+                    elif "feats" in data:
+                        features = torch.from_numpy(data["feats"]).float()
+                    else:
+                        # Use first array
+                        key = list(data.keys())[0]
+                        features = torch.from_numpy(data[key]).float()
+            except Exception as e:
+                logger.warning(f"Failed to load pre-extracted features from {feature_path}: {e}. Falling back to raw audio.")
+                features = None
+        
+        if features is None:
+            # Fall back to raw audio loading
+            waveform, sr = self._safe_load_audio(audio_path, self.feature_extractor.sample_rate)
+            processed_waveform = waveform
+            processed_sr = sr
+            if sr != self.feature_extractor.sample_rate:
+                processed_sr = self.feature_extractor.sample_rate
 
-        if processed_waveform.dim() > 1 and processed_waveform.size(0) > 1:
-            processed_waveform = processed_waveform.mean(dim=0, keepdim=True)
+            if processed_waveform.dim() > 1 and processed_waveform.size(0) > 1:
+                processed_waveform = processed_waveform.mean(dim=0, keepdim=True)
 
-        features = self.feature_extractor(processed_waveform, processed_sr)
+            features = self.feature_extractor(processed_waveform, processed_sr)
 
         if self.cmvn_mean is not None and self.cmvn_std is not None:
             features = (features - self.cmvn_mean) / (self.cmvn_std + 1e-8)
@@ -740,7 +803,13 @@ class S2STManifestDataset(Dataset):
             dtype=torch.long,
         )
 
-        duration_sec = processed_waveform.size(-1) / float(self.feature_extractor.sample_rate)
+        # Calculate duration: use waveform if available, otherwise estimate from features
+        if processed_waveform is not None:
+            duration_sec = processed_waveform.size(-1) / float(self.feature_extractor.sample_rate)
+        else:
+            # Estimate from features (assuming frame shift from feature extractor)
+            frame_shift_sec = self.frame_shift / 1000.0  # Convert ms to seconds
+            duration_sec = features.size(0) * frame_shift_sec
 
         sample: Dict[str, Any] = {
             "id": entry.sample_id,
@@ -763,9 +832,13 @@ class S2STManifestDataset(Dataset):
         }
 
         if self.load_waveform:
-            sample["waveform"] = processed_waveform
-            sample["waveform_sample_rate"] = torch.tensor(self.feature_extractor.sample_rate, dtype=torch.long)
-            sample["waveform_length"] = torch.tensor(processed_waveform.size(-1), dtype=torch.long)
+            if processed_waveform is not None:
+                sample["waveform"] = processed_waveform
+                sample["waveform_sample_rate"] = torch.tensor(self.feature_extractor.sample_rate, dtype=torch.long)
+                sample["waveform_length"] = torch.tensor(processed_waveform.size(-1), dtype=torch.long)
+            else:
+                # If using pre-extracted features, waveform is not available
+                logger.warning(f"load_waveform=True but waveform not available (using pre-extracted features). Skipping waveform in sample.")
 
         if self.load_tgt_audio and entry.tgt_audio:
             tgt_audio_path = self._resolve_path(entry.tgt_audio)

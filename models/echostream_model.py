@@ -143,14 +143,14 @@ class EchoStreamModel(nn.Module):
             embed_dim=encoder_embed_dim,
             num_layers=st_decoder_layers,
             num_heads=encoder_attention_heads,
-            vocab_size=4000,  # SentencePiece vocab size
+            vocab_size=5000,  # SentencePiece vocab size (updated from 4000)
             unidirectional=True,  # For streaming
             dropout=dropout,
         )
         
         # MT Decoder (for text refinement)
         self.mt_decoder = TransformerMTDecoder(
-            vocab_size=4000,  # SentencePiece vocab size
+            vocab_size=5000,  # SentencePiece vocab size (updated from 4000)
             embed_dim=decoder_embed_dim,
             num_layers=mt_decoder_layers,
             num_heads=encoder_attention_heads,
